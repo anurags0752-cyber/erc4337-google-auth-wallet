@@ -1,0 +1,15 @@
+    [
+    {
+        "relation": [
+        "delegate_permission/common.handle_all_urls",
+        "delegate_permission/common.get_login_creds"
+        ],
+        "target": {
+        "namespace": "android_app",
+        "package_name": "com.anonymous.erc4337wallet",
+        "sha256_cert_fingerprints": [
+            "3A:90:EE:76:E0:AD:70:66:4D:8B:2B:96:B8:43:5C:0F:AC:CB:3F:45:A4:24:6A:49:C4:3E:15:1D:38:ED:7F:7A"
+        ]
+        }
+    }
+    ]
