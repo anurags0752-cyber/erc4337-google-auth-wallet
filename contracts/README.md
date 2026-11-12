@@ -1,66 +1,29 @@
-## Foundry
+# ERC-4337 Passkey Smart Contracts (`RIP-7212` on Base Sepolia)
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+Solidity smart contracts implementing an **ERC-4337 v0.7 Smart Account (`IAccount`)** secured by hardware **WebAuthn Passkeys (`secp256r1` / P-256)** and verified on-chain via the **RIP-7212 Precompile (`0x0000000000000000000000000000000000000100`)**.
 
-Foundry consists of:
+## Contracts
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+- **`src/PasskeyAccount.sol`**:
+  - Stores the user's 64-byte uncompressed P-256 public key coordinates `(publicKey_x, publicKey_y)` as `immutable` variables.
+  - Verifies the WebAuthn User Present (`UP`) bit (`authenticatorData[32] & 0x01 != 0`).
+  - Protects against replay attacks by Base64URL-encoding `userOpHash` on-chain and matching it against `clientDataJSON` at `challengeOffset`.
+  - Executes an inline Yul assembly `staticcall` to the RIP-7212 precompile at `0x100` (`~3,450 gas`).
+- **`src/PasskeyAccountFactory.sol`**:
+  - Deploys deterministic smart accounts via `CREATE2` using `keccak256(abi.encodePacked(publicKey_x, publicKey_y))` as the salt.
+  - Deployed on Base Sepolia at [`0xBBC847b874985f7787E3B2756fB71Ca640bd57fF`](https://sepolia.basescan.org/address/0xBBC847b874985f7787E3B2756fB71Ca640bd57fF).
+- **`test/PasskeyAccount.t.sol`**:
+  - Foundry unit tests covering deterministic `CREATE2` prediction, factory idempotency, EntryPoint access control, RIP-7212 `validateUserOp` verification, and replay attack rejection.
 
-## Documentation
+## Commands
 
-https://book.getfoundry.sh/
+```bash
+# Compile contracts
+forge build
 
-## Usage
+# Run unit tests
+forge test -vvv
 
-### Build
-
-```shell
-$ forge build
-```
-
-### Test
-
-```shell
-$ forge test
-```
-
-### Format
-
-```shell
-$ forge fmt
-```
-
-### Gas Snapshots
-
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
+# Deploy PasskeyAccountFactory to Base Sepolia
+forge script script/DeployFactory.s.sol:DeployFactory --rpc-url https://sepolia.base.org --broadcast
 ```

@@ -5,12 +5,15 @@ import * as Passkeys from 'react-native-passkeys';
 import {
   concatHex,
   createPublicClient,
+  encodeAbiParameters,
   encodeFunctionData,
   formatEther,
   http,
   isAddress,
   pad,
+  parseAbiParameters,
   parseEther,
+  sha256,
   toHex,
 } from 'viem';
 import { baseSepolia } from 'viem/chains';
@@ -556,11 +559,82 @@ export function useWallet() {
       args: [cleanTo as `0x${string}`, valueWei, '0x'],
     });
 
-    const verificationGasLimit = accountExists ? 300_000n : 550_000n;
-    const callGasLimit = 120_000n;
-    const preVerificationGas = 60_000n;
+    let verificationGasLimit = accountExists ? 300_000n : 550_000n;
+    let callGasLimit = 120_000n;
+    let preVerificationGas = 60_000n;
     const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas || 1_000_000_000n;
     const maxFeePerGas = feeData.maxFeePerGas || 2_000_000_000n;
+    let paymasterAndData: `0x${string}` = '0x';
+
+    // Build unpacked UserOp for Bundler / Paymaster JSON-RPC v0.7 calls
+    const rpcUserOp: Record<string, string> = {
+      sender: account.address,
+      nonce: toHex(currentNonce),
+      callData,
+      callGasLimit: toHex(callGasLimit),
+      verificationGasLimit: toHex(verificationGasLimit),
+      preVerificationGas: toHex(preVerificationGas),
+      maxFeePerGas: toHex(maxFeePerGas),
+      maxPriorityFeePerGas: toHex(maxPriorityFeePerGas),
+      signature: '0x',
+    };
+
+    if (!accountExists) {
+      rpcUserOp.factory = CONTRACTS.factory;
+      rpcUserOp.factoryData = factoryData;
+    }
+
+    // 3b. Request Paymaster Sponsorship BEFORE computing userOpHash (since userOpHash covers paymasterAndData)
+    if (settings.paymasterUrl.trim()) {
+      try {
+        const pmRes = await fetch(settings.paymasterUrl.trim(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'pm_sponsorUserOperation',
+            params: [rpcUserOp, CONTRACTS.entryPoint],
+          }),
+        });
+        const pmJson = await pmRes.json();
+        const pm = pmJson?.result;
+        if (pm) {
+          if (pm.callGasLimit) {
+            callGasLimit = BigInt(pm.callGasLimit);
+            rpcUserOp.callGasLimit = pm.callGasLimit;
+          }
+          if (pm.verificationGasLimit) {
+            verificationGasLimit = BigInt(pm.verificationGasLimit);
+            rpcUserOp.verificationGasLimit = pm.verificationGasLimit;
+          }
+          if (pm.preVerificationGas) {
+            preVerificationGas = BigInt(pm.preVerificationGas);
+            rpcUserOp.preVerificationGas = pm.preVerificationGas;
+          }
+          if (pm.paymasterAndData && pm.paymasterAndData !== '0x') {
+            paymasterAndData = pm.paymasterAndData as `0x${string}`;
+            rpcUserOp.paymasterAndData = pm.paymasterAndData;
+          } else if (pm.paymaster) {
+            const pmVerifGas = BigInt(pm.paymasterVerificationGasLimit || '0x30000');
+            const pmPostOpGas = BigInt(pm.paymasterPostOpGasLimit || '0x10000');
+            const pmData = (pm.paymasterData || '0x') as `0x${string}`;
+            paymasterAndData = concatHex([
+              pm.paymaster as `0x${string}`,
+              pad(toHex(pmVerifGas), { size: 16 }),
+              pad(toHex(pmPostOpGas), { size: 16 }),
+              pmData,
+            ]);
+            rpcUserOp.paymaster = pm.paymaster;
+            rpcUserOp.paymasterVerificationGasLimit = toHex(pmVerifGas);
+            rpcUserOp.paymasterPostOpGasLimit = toHex(pmPostOpGas);
+            rpcUserOp.paymasterData = pmData;
+          }
+        }
+      } catch (pmErr) {
+        console.warn('Paymaster sponsorship skipped:', pmErr);
+      }
+    }
 
     const accountGasLimits = packUint128Pair(verificationGasLimit, callGasLimit);
     const gasFees = packUint128Pair(maxPriorityFeePerGas, maxFeePerGas);
@@ -573,7 +647,7 @@ export function useWallet() {
       accountGasLimits,
       preVerificationGas,
       gasFees,
-      paymasterAndData: '0x' as `0x${string}`,
+      paymasterAndData,
       signature: '0x' as `0x${string}`,
     };
 
@@ -615,50 +689,33 @@ export function useWallet() {
 
     params.onStep?.('submitting');
 
+    // 6b. Verify P-256 signature on-chain against Base Sepolia's RIP-7212 Precompile (0x100)
+    const authHex = `0x${Buffer.from(authDataBytes).toString('hex')}` as `0x${string}`;
+    const clientDataHash = sha256(clientDataBytes);
+    const messageHash = sha256(concatHex([authHex, clientDataHash]));
+    const rip7212Input = encodeAbiParameters(
+      parseAbiParameters('bytes32, uint256, uint256, bytes32, bytes32'),
+      [messageHash, r, s, account.publicKeyX, account.publicKeyY]
+    );
+
+    const precompileVerification = await publicClient.call({
+      to: CONTRACTS.rip7212Precompile,
+      data: rip7212Input,
+    });
+
+    const isPrecompileValid =
+      precompileVerification.data && BigInt(precompileVerification.data) === 1n;
+    if (!isPrecompileValid) {
+      throw new Error('On-chain RIP-7212 (0x100) P-256 signature verification failed.');
+    }
+
     let txHash: `0x${string}` | undefined;
     let mode: 'bundler' | 'signed-userop' = 'signed-userop';
 
     // 7. Submit to ERC-4337 v0.7 Bundler if configured
     const activeBundlerUrl = settings.bundlerUrl.trim();
     if (activeBundlerUrl) {
-      const rpcUserOp: Record<string, string> = {
-        sender: account.address,
-        nonce: toHex(currentNonce),
-        callData,
-        callGasLimit: toHex(callGasLimit),
-        verificationGasLimit: toHex(verificationGasLimit),
-        preVerificationGas: toHex(preVerificationGas),
-        maxFeePerGas: toHex(maxFeePerGas),
-        maxPriorityFeePerGas: toHex(maxPriorityFeePerGas),
-        signature: packedSignature,
-      };
-
-      if (!accountExists) {
-        rpcUserOp.factory = CONTRACTS.factory;
-        rpcUserOp.factoryData = factoryData;
-      }
-
-      // Optional Paymaster Sponsorship if paymasterUrl is configured
-      if (settings.paymasterUrl.trim()) {
-        try {
-          const pmRes = await fetch(settings.paymasterUrl.trim(), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              jsonrpc: '2.0',
-              id: 1,
-              method: 'pm_sponsorUserOperation',
-              params: [rpcUserOp, CONTRACTS.entryPoint],
-            }),
-          });
-          const pmJson = await pmRes.json();
-          if (pmJson?.result) {
-            Object.assign(rpcUserOp, pmJson.result);
-          }
-        } catch (pmErr) {
-          console.warn('Paymaster sponsorship skipped:', pmErr);
-        }
-      }
+      rpcUserOp.signature = packedSignature;
 
       const bundleRes = await fetch(activeBundlerUrl, {
         method: 'POST',
